@@ -4,7 +4,6 @@ import agent, { MCP_SERVERS } from "./agent.ts";
 
 const HEAVY = "community/ZapGaming/llama3.1-8b-xturbo";
 const TOOLS = "community/ZapGaming/mercury-2-ultrafast";
-const FAST = "community/ZapGaming/llama3.1-8b-ultrafast";
 
 function labelReply(label: string) {
 	return Response.json({
@@ -80,7 +79,7 @@ test("TOOLS label runs the full tool loop over every MCP server", async () => {
 		MCP_SERVERS.map((s) => s + "-tool").sort(),
 	);
 	const instructions = config.instructions as string;
-	assert.match(instructions, /Overclock/);
+	assert.match(instructions, /OVERCLOCK/);
 	assert.match(instructions, /Cite sources\./);
 	// The router call itself never reached pollinations a second time.
 	assert.equal(calls.filter((c) => c.kind === "pollinations").length, 0);
@@ -124,26 +123,20 @@ test("HEAVY label forwards to the xturbo lane with the caller's stream intact", 
 	assert.equal(call.body.tools, undefined);
 	assert.equal(call.body.tool_choice, undefined);
 	const instructions = call.body.instructions as string;
-	assert.match(instructions, /Overclock/);
+	assert.match(instructions, /OVERCLOCK/);
 	assert.match(instructions, /Target macOS\./);
 	// Everything else rides through untouched.
 	assert.deepEqual(call.body.input, body.input);
 });
 
-test("FAST label with an oversized conversation downgrades to the 90k lane", async () => {
-	const body = { input: "Explain this. " + "x".repeat(30_000) };
-	const { ctx, calls } = makeContext("FAST", body);
-	await agent(ctx);
-	const call = calls[0] as Extract<Call, { kind: "pollinations" }>;
-	assert.equal(call.body.model, TOOLS);
-});
-
-test("TOOLS label with an oversized conversation loses the tool loop, keeps the lane", async () => {
+test("an oversized TOOLS ask downgrades to xturbo and loses the tool loop", async () => {
 	const body = { input: "Summarise this transcript. " + "y".repeat(300_000) };
 	const { ctx, calls } = makeContext("TOOLS", body);
 	await agent(ctx);
 	const call = calls[0] as Extract<Call, { kind: "pollinations" }>;
 	assert.equal(call.body.model, HEAVY);
+	assert.equal(call.body.tools, undefined);
+	assert.equal(call.body.tool_choice, undefined);
 });
 
 test("the router never sees the full conversation", async () => {
@@ -151,7 +144,7 @@ test("the router never sees the full conversation", async () => {
 		role: i % 2 ? "assistant" : "user",
 		content: "turn " + i + ": " + "z".repeat(1000),
 	}));
-	const { ctx, routerInput } = makeContext("FAST", { input: messages });
+	const { ctx, routerInput } = makeContext("HEAVY", { input: messages });
 	await agent(ctx);
 	const view = routerInput();
 	assert.ok(view.length < 3200, "router input was " + view.length);

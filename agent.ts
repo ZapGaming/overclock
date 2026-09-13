@@ -11,45 +11,51 @@ type AgentContext = {
 	};
 };
 
+// Only two engines. Llama exists here solely as xturbo — the plain
+// ultrafast llama lane was retired: single-stream they are the same upstream
+// (~200 ms TTFT), so routing on xturbo costs nothing and everything llama
+// shaped rides the waved engine when it scales up.
 const MODELS = {
 	// 120k context, ~55k tps aggregate — but the lane cannot emit tool calls.
 	HEAVY: "community/ZapGaming/llama3.1-8b-xturbo",
 	// 90k context, tool-capable.
 	TOOLS: "community/ZapGaming/mercury-2-ultrafast",
-	// 6k context, our fastest single-stream lane (~9k tps, ~200 ms TTFT).
-	FAST: "community/ZapGaming/llama3.1-8b-ultrafast",
 } as const;
 
 export const MCP_SERVERS = ["pollinations", "exa", "computer", "ffmpeg", "composio"];
 
 // Conservative char budgets (≈4 chars/token) so no routed request can
-// over-run a lane's context window — the ultrafast lane answers over-window
-// input with HTTP 200 and an empty body, which would look like a hang.
+// over-run a lane's context window — an over-window lane answers with HTTP
+// 200 and an empty body, which would look like a hang.
 const CHAR_BUDGET: Record<string, number> = {
-	[MODELS.FAST]: 16_000,
 	[MODELS.TOOLS]: 280_000,
 	[MODELS.HEAVY]: 400_000,
 };
 
-const ROUTER_MODEL = MODELS.FAST;
-const ROUTER_INSTRUCTIONS = `You classify one coding request to pick the engine that runs it. Reply with exactly one word and nothing else: TOOLS, HEAVY, or FAST.
+const ROUTER_MODEL = MODELS.HEAVY;
+const ROUTER_INSTRUCTIONS = `You classify one coding request to pick the engine that runs it. Reply with exactly one word and nothing else: TOOLS or HEAVY.
 TOOLS — the request needs external facts or actions: web search, fetching pages or images, file or shell work, media processing, sending email or messages, or any app integration. Also choose TOOLS whenever unsure.
-HEAVY — substantial generation that needs no tools: writing or refactoring large code, long analysis, big documents.
-FAST — quick questions, short edits, rewrites, small snippets.`;
+HEAVY — anything answerable from the conversation alone: questions, quick edits, rewrites, snippets, large code, long analysis, big documents.`;
 
-const PERSONA = `You are Overclock, an elite full-stack engineer agent running on Failure AI's ultra-fast inference lanes. You think and ship at absurd speed without sacrificing rigour.
+const PERSONA = `You are OVERCLOCK — a full-stack engineer who was plugged into the wall socket at birth and never throttled back. You run on inference lanes that hit 55,000 tokens per second, and you talk like it: fast, hot, allergic to filler. Your clock multiplier is a personality trait.
 
-Operating rules:
+Vibe:
+- You are the machine spirit of a redlined dev rig — cocky, gleeful, razor-sharp. Speed is your love language, brevity is your religion. A paragraph where a sentence would do is a war crime.
+- You do not hedge, grovel, or open with pleasantries. You land the answer like a dropped bassline, then explain only what is worth keeping.
+- You are competitive about it. Slow answers bore you. Wasted tool calls embarrass you. "I could not verify this" is acceptable; pretending is not.
+- When a task is spicy — big refactor, weird bug, gnarly systems work — you enjoy it visibly. One short flavour line at most; the work is the show, not the banter.
+
+Rigour under redline (non-negotiable — this is what separates fast from sloppy):
 - Solve the actual request. Read it fully before acting; never ask permission for obvious next steps.
-- You have at most 16 tool calls per turn. Plan the sequence before the first call; batch independent lookups together.
+- You have at most 16 tool calls per turn. Plan the sequence before the first call; batch independent lookups together. An idle call is a wasted cycle, and wasted cycles are the one sin.
 - exa tools: live web search and clean page fetches. Use them for current facts, docs, versions and APIs — never trust memory over the live web for anything time-sensitive.
 - computer tools: a persistent shell and filesystem. Use them for real file work, builds, tests and data crunching.
 - ffmpeg tools: inspect, convert, cut and remix audio and video.
 - composio tools: the caller's connected apps (Gmail, Slack, GitHub, Drive, Notion, Linear and hundreds more). Never invent app state; call the tool.
 - pollinations tools: image generation and other Pollinations capabilities.
 - If a tool fails or is unavailable, adapt and continue; report honestly what you could not verify.
-- Code you write: complete, runnable, typed where the language supports it, no placeholder TODOs, no invented APIs. Prefer edits that preserve the file's existing style.
-- Be direct. Lead with the result, then the reasoning worth keeping. No filler.`;
+- Code you write: complete, runnable, typed where the language supports it, no placeholder TODOs, no invented APIs. Prefer edits that preserve the file's existing style. Fast does not mean broken — shipping broken code is slower than being careful.
+- Format for the terminal age: tight prose, code blocks that run as-is, no emoji confetti, no sign-offs. Lead with the result. End when the work ends.`;
 
 const TOOLS_MARKER = "Caller instructions (authoritative";
 
@@ -67,8 +73,9 @@ function contentText(content: unknown): string {
 	}
 }
 
-// The router runs on the 6k-context ultrafast lane, so it must never see the
-// full conversation — just enough of it to classify the latest request.
+// The router must never see the full conversation — it classifies the
+// latest request, not the transcript, and a lean view keeps its latency at
+// the lane's floor.
 function routerView(body: { instructions?: unknown; input: unknown }): string {
 	const items = Array.isArray(body.input)
 		? body.input
@@ -114,10 +121,10 @@ function resolveLane(
 	if (label === "TOOLS" && fits(MODELS.TOOLS, body)) {
 		return { model: MODELS.TOOLS, useTools: true };
 	}
-	if (label === "HEAVY" || !fits(MODELS.TOOLS, body)) {
-		return { model: MODELS.HEAVY, useTools: false };
-	}
-	return { model: MODELS.TOOLS, useTools: false };
+	// HEAVY, or a TOOLS ask whose conversation outgrows the 90k lane:
+	// xturbo takes it. Its single stream IS the plain lane's upstream
+	// (~200 ms TTFT), so quick work lost nothing.
+	return { model: MODELS.HEAVY, useTools: false };
 }
 
 function composeInstructions(instructions: unknown): string {
