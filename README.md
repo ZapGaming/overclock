@@ -1,17 +1,16 @@
 # Overclock
 
-The most extensive coding agent on Pollinations — OVERCLOCK, a redlined persona-driven pair programmer that routes every request across Failure AI's fastest community engines and carries a full MCP tool belt. Routing and model calls use the caller's Pollen, never the publisher's keys.
+The most extensive coding agent on Pollinations — OVERCLOCK, a redlined persona-driven pair programmer on a single Failure AI engine with DCH V2 context compression, carrying a full MCP tool belt. All model calls use the caller's Pollen, never the publisher's keys.
 
-**Engines** (two, both Failure AI community models — llama exists here solely as xturbo; the plain ultrafast llama lane was retired because single-stream they are the same upstream, and this way every llama-shaped request rides the waved engine when it scales):
+**Engine** (one, on purpose — xturbo was retired as a routing target because it cannot emit tool calls, and an agent without tools is not an agent):
 
-| Label | Model | Why |
-| --- | --- | --- |
-| `TOOLS` | `community/ZapGaming/mercury-2-ultrafast` | 90k ctx, honours upstream `tools` — the only engine that can drive the tool loop |
-| `HEAVY` | `community/ZapGaming/llama3.1-8b-xturbo` | 120k ctx (DCH V2), ~55k tps aggregate — long code, big refactors, huge output, *and* everything quick |
+| Model | Why |
+| --- | --- |
+| `community/ZapGaming/mercury-2-ultrafast` | 80k ctx, honours upstream `tools` — drives the whole loop |
 
-A ~16-token router call classifies each request (`TOOLS` / `HEAVY`) and itself rides the xturbo engine; the router only ever sees a ≤3,200-char head-and-tail view of the conversation (our lanes answer over-window input with HTTP 200 and *zero* tokens — a trap we designed around, not discovered).
+**DCH V2** — Dynamic Context Hierarchization, folded into the engine (same design as the gateway's `failure-turbo-x`). The trigger is input size only: a conversation at or under the ~70k-token window passes through untouched; past it, the middle span is map-reduced into digests *before* the tool loop sees it — head (leading system items) and a verbatim tail (bounded to a quarter window) stay word-for-word, chunks are summarised in parallel (8 at a time) by the same engine, digests pair-merge under the budget, and a final truncation guard guarantees the composed request always fits (the lane answers over-window input with HTTP 200 and *zero* tokens — a trap designed around, not discovered). Digests are content-hash cached, so a growing conversation re-summarises only new chunks. Input past the 120k-token DCH ceiling fails loudly rather than silently truncating.
 
-**Tools** — the `TOOLS` lane runs the Vercel AI SDK tool loop with every Pollinations MCP server merged in: `pollinations` (image gen, models), `exa` (live web search + fetch), `computer` (persistent shell + files), `ffmpeg` (audio/video), `composio` (Gmail, Slack, GitHub, Drive, Notion, Linear, hundreds more). A server that fails to enumerate (e.g. a caller with no composio connections) is skipped, not fatal. Up to 16 tool calls and 20 loop steps per request.
+**Tools** — the Vercel AI SDK tool loop with every Pollinations MCP server merged in: `pollinations` (image gen, models), `exa` (live web search + fetch), `computer` (persistent shell + files), `ffmpeg` (audio/video), `composio` (Gmail, Slack, GitHub, Drive, Notion, Linear, hundreds more). A server that fails to enumerate (e.g. a caller with no composio connections) is skipped, not fatal. Up to 16 tool calls and 20 loop steps per request.
 
 ## Deploy
 
@@ -26,6 +25,6 @@ bun install
 bun test agent.test.ts
 ```
 
-Six tests cover the router contract: engine resolution, the tools merge (including a half-failed server list), the ≤3,200-char router view, over-window downgrade to xturbo passthrough, passthrough tool-stripping, and invalid-label failure.
+Eleven tests cover: the tools merge (including a half-failed server list), DCH V2 (under-window passthrough untouched, over-window compression with tail preserved, the heavy-tail case, cache hits making no second digest calls, the loud over-ceiling failure, a failing digest upstream failing loudly, and the composed-request fit guarantee for any accepted size).
 
 [Agent guide](https://github.com/pollinations/pollinations/blob/main/BUILD_YOUR_OWN_AGENT.md) · [More examples](https://github.com/orgs/pollinations/repositories?q=topic%3Apollinations-code-agent-example)

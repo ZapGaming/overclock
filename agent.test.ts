@@ -1,52 +1,37 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import agent, { MCP_SERVERS } from "./agent.ts";
+import agent, { MCP_SERVERS, dchCompress } from "./agent.ts";
 
-const HEAVY = "community/ZapGaming/llama3.1-8b-xturbo";
-const TOOLS = "community/ZapGaming/mercury-2-ultrafast";
-
-function labelReply(label: string) {
-	return Response.json({
-		output: [{ content: [{ type: "output_text", text: label }] }],
-	});
-}
+const MODEL_ID = "community/ZapGaming/mercury-2-ultrafast";
 
 type Call =
 	| { kind: "pollinations"; path: string; body: Record<string, unknown> }
 	| { kind: "respond"; config: Record<string, unknown> };
 
-function makeContext(label: string, body: unknown, opts: {
-	downstream?: Response;
-	respondResult?: Response;
+function makeContext(body: unknown, opts: {
+	digestReply?: string;
+	digestStatus?: number;
 	failServers?: string[];
 } = {}) {
 	const calls: Call[] = [];
-	let pollinationsCalls = 0;
-	let routerInput = "";
-	const downstream = opts.downstream ?? new Response("downstream");
-	const respondResult = opts.respondResult ?? new Response("responded");
+	const digestReply = opts.digestReply ?? "digest: kept names and decisions.";
 	const ctx = {
 		request: new Request("https://gen.pollinations.ai/v1/responses", {
 			method: "POST",
 			body: JSON.stringify(body),
 		}),
 		pollinations: async (path: string, init?: RequestInit) => {
-			pollinationsCalls++;
-			if (pollinationsCalls === 1) {
-				routerInput = (JSON.parse(init?.body as string) as { input: string }).input;
-				return labelReply(label);
-			}
-			calls.push({
-				kind: "pollinations",
-				path,
-				body: JSON.parse(init?.body as string),
+			const parsed = JSON.parse(init?.body as string) as Record<string, unknown>;
+			calls.push({ kind: "pollinations", path, body: parsed });
+			if (opts.digestStatus) return new Response("nope", { status: opts.digestStatus });
+			return Response.json({
+				output: [{ content: [{ type: "output_text", text: digestReply }] }],
 			});
-			return downstream;
 		},
 		model: (id: string) => ({ sdkModel: id }),
 		respond: async (config: Record<string, unknown>) => {
 			calls.push({ kind: "respond", config });
-			return respondResult;
+			return new Response("responded");
 		},
 		mcp: {
 			tools: async (server: string) => {
@@ -58,20 +43,24 @@ function makeContext(label: string, body: unknown, opts: {
 			listTools: async () => ({}),
 		},
 	};
-	return { ctx, calls, routerInput: () => routerInput, downstream, respondResult };
+	return { ctx, calls };
 }
 
-test("TOOLS label runs the full tool loop over every MCP server", async () => {
-	const { ctx, calls, respondResult } = makeContext("TOOLS", {
+function respondCall(calls: Call[]) {
+	const call = calls.find((c) => c.kind === "respond") as Extract<Call, { kind: "respond" }>;
+	assert.ok(call, "no respond call was made");
+	return call.config;
+}
+
+test("every request runs the full tool loop over every MCP server", async () => {
+	const { ctx, calls } = makeContext({
 		input: "Search the web for the latest Bun release and summarise it.",
 		instructions: "Cite sources.",
 	});
-	const result = await agent(ctx);
-	assert.equal(result, respondResult);
-	assert.equal(calls.length, 1);
-	const call = calls[0] as Extract<Call, { kind: "respond" }>;
-	const config = call.config;
-	assert.deepEqual((config.model as { sdkModel: string }).sdkModel, TOOLS);
+	await agent(ctx);
+	const config = respondCall(calls);
+	assert.equal(calls.filter((c) => c.kind === "pollinations").length, 0);
+	assert.equal((config.model as { sdkModel: string }).sdkModel, MODEL_ID);
 	assert.equal(config.stopWhen !== undefined, true);
 	const tools = config.tools as { name: string }[];
 	assert.deepEqual(
@@ -81,19 +70,19 @@ test("TOOLS label runs the full tool loop over every MCP server", async () => {
 	const instructions = config.instructions as string;
 	assert.match(instructions, /OVERCLOCK/);
 	assert.match(instructions, /Cite sources\./);
-	// The router call itself never reached pollinations a second time.
-	assert.equal(calls.filter((c) => c.kind === "pollinations").length, 0);
+	assert.deepEqual(config.input, [
+		{ role: "user", content: "Search the web for the latest Bun release and summarise it." },
+	]);
 });
 
 test("a server that fails to expose tools does not break the belt", async () => {
 	const { ctx, calls } = makeContext(
-		"TOOLS",
 		{ input: "check my gmail" },
 		{ failServers: ["composio", "ffmpeg"] },
 	);
 	await agent(ctx);
-	const call = calls[0] as Extract<Call, { kind: "respond" }>;
-	const tools = call.config.tools as { name: string }[];
+	const config = respondCall(calls);
+	const tools = config.tools as { name: string }[];
 	assert.deepEqual(tools.map((t) => t.name).sort(), [
 		"computer-tool",
 		"exa-tool",
@@ -101,70 +90,111 @@ test("a server that fails to expose tools does not break the belt", async () => 
 	]);
 });
 
-test("HEAVY label forwards to the xturbo lane with the caller's stream intact", async () => {
-	const body = {
-		model: "ZapGaming/overclock",
-		input: [
-			{ role: "user", content: "Write a 2000-line Zig allocator." },
-		],
-		instructions: "Target macOS.",
-		stream: true,
-		tools: [{ type: "function", name: "caller-tool" }],
-		tool_choice: "auto",
-	};
-	const { ctx, calls, downstream } = makeContext("HEAVY", body);
-	const result = await agent(ctx);
-	assert.equal(result, downstream);
-	assert.equal(calls.length, 1);
-	const call = calls[0] as Extract<Call, { kind: "pollinations" }>;
-	assert.equal(call.path, "/v1/responses");
-	assert.equal(call.body.model, HEAVY);
-	assert.equal(call.body.stream, true);
-	assert.equal(call.body.tools, undefined);
-	assert.equal(call.body.tool_choice, undefined);
-	const instructions = call.body.instructions as string;
-	assert.match(instructions, /OVERCLOCK/);
-	assert.match(instructions, /Target macOS\./);
-	// Everything else rides through untouched.
-	assert.deepEqual(call.body.input, body.input);
-});
-
-test("an oversized TOOLS ask downgrades to xturbo and loses the tool loop", async () => {
-	const body = { input: "Summarise this transcript. " + "y".repeat(300_000) };
-	const { ctx, calls } = makeContext("TOOLS", body);
+test("a string input becomes a user message", async () => {
+	const { ctx, calls } = makeContext({ input: "hi" });
 	await agent(ctx);
-	const call = calls[0] as Extract<Call, { kind: "pollinations" }>;
-	assert.equal(call.body.model, HEAVY);
-	assert.equal(call.body.tools, undefined);
-	assert.equal(call.body.tool_choice, undefined);
+	assert.deepEqual(respondCall(calls).input, [{ role: "user", content: "hi" }]);
 });
 
-test("the router never sees the full conversation", async () => {
-	const messages = Array.from({ length: 60 }, (_, i) => ({
+test("a caller stream flag rides through to the respond config", async () => {
+	const { ctx, calls } = makeContext({ input: "hi", stream: true });
+	await agent(ctx);
+	assert.equal(respondCall(calls).stream, true);
+});
+
+test("DCH V2 leaves an under-window conversation untouched", async () => {
+	const items = Array.from({ length: 30 }, (_, i) => ({
 		role: i % 2 ? "assistant" : "user",
-		content: "turn " + i + ": " + "z".repeat(1000),
+		content: "turn " + i + ": " + "x".repeat(4000),
 	}));
-	const { ctx, routerInput } = makeContext("HEAVY", { input: messages });
+	const { ctx, calls } = makeContext({ input: items });
 	await agent(ctx);
-	const view = routerInput();
-	assert.ok(view.length < 3200, "router input was " + view.length);
-	assert.match(view, /conversation truncated/);
+	const config = respondCall(calls);
+	assert.equal(calls.filter((c) => c.kind === "pollinations").length, 0);
+	assert.deepEqual(config.input, items);
 });
 
-test("an invalid routing label fails loudly without a downstream call", async () => {
-	const { ctx, calls, downstream } = makeContext("OK", { input: "hi" });
-	let bodyGuard = new Response("never");
-	const sentinel = new Response("sentinel");
-	// replace downstream sentinel so a wrong passthrough is detectable
-	const ctx2 = { ...ctx, pollinations: async (path: string, init?: RequestInit) => {
-		const first = !(calls.length);
-		if (first) return labelReply("OK");
-		calls.push({ kind: "pollinations", path, body: JSON.parse(init?.body as string) });
-		return sentinel;
-	} };
-	bodyGuard = sentinel;
-	await assert.rejects(agent(ctx2), /invalid label/);
-	assert.equal(calls.length, 0);
-	assert.equal(bodyGuard, sentinel);
-	assert.notEqual(downstream, null);
+test("DCH V2 compresses an over-window conversation to fit", async () => {
+	const items = Array.from({ length: 40 }, (_, i) => ({
+		role: i % 2 ? "assistant" : "user",
+		content: "turn " + i + ": " + "y".repeat(8000),
+	}));
+	const tail = { role: "user", content: "final ask: " + "z".repeat(2000) };
+	const { ctx, calls } = makeContext({ input: [...items, tail] });
+	await agent(ctx);
+	const config = respondCall(calls);
+	const digestCalls = calls.filter((c) => c.kind === "pollinations");
+	assert.ok(digestCalls.length > 0, "expected digest calls");
+	const input = config.input as { role: string; content: string }[];
+	assert.ok(input.length < items.length, "input should be much smaller");
+	assert.match(input[0].content, /DCH V2/);
+	const serialized = JSON.stringify(input);
+	assert.ok(
+		serialized.length < 280_000,
+		"composed input was " + serialized.length + " chars",
+	);
+	// The tail survives verbatim.
+	const last = input[input.length - 1];
+	assert.ok(String(last.content).startsWith("final ask:"));
+});
+
+test("DCH V2 cache: a second identical request makes no new digest calls", async () => {
+	const items = Array.from({ length: 40 }, (_, i) => ({
+		role: i % 2 ? "assistant" : "user",
+		content: "cache turn " + i + ": " + "v".repeat(8000),
+	}));
+	const body = { input: items };
+	const first = makeContext(body);
+	await agent(first.ctx);
+	const firstDigests = first.calls.filter((c) => c.kind === "pollinations").length;
+	assert.ok(firstDigests > 0);
+	const second = makeContext(body);
+	await agent(second.ctx);
+	assert.equal(
+		second.calls.filter((c) => c.kind === "pollinations").length,
+		0,
+		"digest cache missed on an identical conversation",
+	);
+});
+
+test("a single message heavier than the window is heavy-tailed, not dropped", async () => {
+	const huge = "log line: " + "w".repeat(300_000) + " END-OF-LOG-MARKER";
+	const body = { input: [{ role: "user", content: "here" }, { role: "user", content: huge }] };
+	const { ctx, calls } = makeContext(body);
+	await agent(ctx);
+	const config = respondCall(calls);
+	const input = config.input as { role: string; content: string }[];
+	const serialized = JSON.stringify(input);
+	assert.ok(serialized.length < 280_000, "composed input was " + serialized.length);
+	// The verbatim tail of the heavy message survives.
+	const last = input[input.length - 1];
+	assert.match(String(last.content), /END-OF-LOG-MARKER/);
+});
+
+test("input past the DCH ceiling fails loudly with no respond call", async () => {
+	const body = { input: "q".repeat(520_000) };
+	const { ctx, calls } = makeContext(body);
+	await assert.rejects(agent(ctx), /ceiling/);
+	assert.equal(calls.filter((c) => c.kind === "respond").length, 0);
+});
+
+test("a failing digest upstream fails the request loudly", async () => {
+	const items = Array.from({ length: 40 }, (_, i) => ({
+		role: i % 2 ? "assistant" : "user",
+		content: "fault turn " + i + ": " + "u".repeat(8000),
+	}));
+	const { ctx, calls } = makeContext({ input: items }, { digestStatus: 502 });
+	await assert.rejects(agent(ctx), /digest request failed/);
+	assert.equal(calls.filter((c) => c.kind === "respond").length, 0);
+});
+
+test("dchCompress guarantees the composed request fits for any size", async () => {
+	const noop = async () => Response.json({ output: [] });
+	const items = Array.from({ length: 45 }, (_, i) => ({
+		role: i % 2 ? "assistant" : "user",
+		content: "msg " + i + ": " + "m".repeat(8500),
+	}));
+	const { items: composed } = await dchCompress(items, 9_000, noop);
+	const size = JSON.stringify(composed).length;
+	assert.ok(size <= 289_000, "composed input was " + size + " chars");
 });
